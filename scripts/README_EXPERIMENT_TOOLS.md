@@ -31,7 +31,31 @@ formal_cloud_results/paper_table.csv
 formal_cloud_results/paper_table.md
 ```
 
-## 3. Generate Figures
+## 3. Run Loss-Based MIA
+
+Loss-based MIA reads saved LoRA checkpoints and writes metrics back into each
+`final_results.json`, so new V3 runs should include `--save`.
+
+Evaluate one run or a whole result root:
+
+```bash
+python scripts/mia_loss_based.py formal_cloud_results
+```
+
+Optional controls:
+
+```bash
+python scripts/mia_loss_based.py formal_cloud_results --checkpoint-label post_unlearn --sample-limit 128
+```
+
+New metrics written into `experiment_metrics` include:
+
+- `mia_loss_auc`
+- `mia_loss_tpr_at_fpr001`
+- `mia_member_count`
+- `mia_nonmember_count`
+
+## 4. Generate Figures
 
 Create PNG figures:
 
@@ -60,7 +84,7 @@ Generated figures include:
 - `guard_steps`
 - `unlearning_time`
 
-## 4. Cloud Run Template
+## 5. Cloud Run Template
 
 Run a quick cloud smoke test first:
 
@@ -108,4 +132,32 @@ ROUNDS=10
 DATA_SAMPLE=0.2
 LOCAL_STEP=2
 FORGET_CLIENT_IDX=0
+```
+
+## 6. V3 Core Suite
+
+For the V3 paper-strengthening runs, use the dedicated suite. It adds:
+
+- `--save` checkpoints for later MIA
+- `ga`
+- `ga_guarded`
+- `retrain_oracle`
+- automatic `MIA -> summary -> paper_table -> figures`
+
+Example:
+
+```bash
+PYTHON_BIN=/path/to/python \
+MODEL=/path/to/local/model/or/hf_id \
+DATA=/path/to/databricks-dolly-15k.jsonl \
+ROOT=formal_cloud_results/v3_iid_seed5 \
+SEEDS="42 43 44 45 46" \
+IID=0 \
+bash scripts/run_v3_core_suite.sh
+```
+
+For the non-IID validation, keep the same script and change only `IID`:
+
+```bash
+IID=dir0.5 bash scripts/run_v3_core_suite.sh
 ```

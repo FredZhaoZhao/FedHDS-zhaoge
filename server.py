@@ -465,6 +465,317 @@ class Server(object):
 
         return selected, records
 
+    def _apply_precomputed_unlearning_updates(
+        self,
+        params,
+        updates,
+        target_client,
+        scale,
+        reference_batch=None,
+        ref_loader=None,
+        allow_clipping=True,
+        allow_direction_check=True,
+        allow_ref_guard=True,
+        allow_global_guard=True,
+        allow_forget_guard=True,
+        fixed_sign=None,
+        method_label='FedHDS',
+    ):
+        update_stats = self._tensor_list_stats(updates)
+        max_update_norm = getattr(self.args, 'unlearn_max_update_norm', 0.0)
+        clip_enabled = allow_clipping and max_update_norm is not None and max_update_norm > 0
+        clip_coefficient = 1.0
+        scaled_update_l2_norm_before = update_stats['l2_norm'] * abs(scale)
+        scaled_update_max_abs_before = update_stats['max_abs'] * abs(scale)
+
+        if clip_enabled and scaled_update_l2_norm_before > max_update_norm and scaled_update_l2_norm_before > 0:
+            clip_coefficient = max_update_norm / scaled_update_l2_norm_before
+            scale *= clip_coefficient
+
+        scaled_update_l2_norm_after = scaled_update_l2_norm_before * clip_coefficient
+        scaled_update_max_abs_after = scaled_update_max_abs_before * clip_coefficient
+
+        self.experiment_metrics['unlearn_eta'] = getattr(self.args, 'unlearn_eta', 1.0)
+        self.experiment_metrics['unlearn_max_update_norm'] = max_update_norm
+        self.experiment_metrics['update_clipping_enabled'] = clip_enabled
+        self.experiment_metrics['update_clip_applied'] = clip_coefficient < 1.0
+        self.experiment_metrics['update_clip_coefficient'] = clip_coefficient
+        self.experiment_metrics['scaled_update_l2_norm_before_clipping'] = scaled_update_l2_norm_before
+        self.experiment_metrics['scaled_update_l2_norm_after_clipping'] = scaled_update_l2_norm_after
+        self.experiment_metrics['scaled_update_max_abs_before_clipping'] = scaled_update_max_abs_before
+        self.experiment_metrics['scaled_update_max_abs_after_clipping'] = scaled_update_max_abs_after
+        self.experiment_metrics['scaled_update_l2_norm'] = scaled_update_l2_norm_after
+        self.experiment_metrics['scaled_update_max_abs'] = scaled_update_max_abs_after
+        print(
+            f"[{method_label}] Scaled update norm: "
+            f"before_clip_L2={scaled_update_l2_norm_before:.6e}, "
+            f"after_clip_L2={scaled_update_l2_norm_after:.6e}, "
+            f"clip_coef={clip_coefficient:.6e}, "
+            f"after_clip_max_abs={scaled_update_max_abs_after:.6e}"
+        )
+
+        unlearn_num_steps = max(1, getattr(self.args, 'unlearn_num_steps', 1))
+        ref_guard_ratio = (
+            getattr(self.args, 'unlearn_ref_loss_guard_ratio', 0.0)
+            if allow_ref_guard
+            else 0.0
+        )
+        global_guard_max = (
+            getattr(self.args, 'unlearn_global_loss_guard_max', 0.0)
+            if allow_global_guard
+            else 0.0
+        )
+        update_sign_mode = fixed_sign or getattr(self.args, 'unlearn_update_sign', 'positive')
+        direction_check_enabled = (
+            allow_direction_check and getattr(self.args, 'unlearn_direction_check', False)
+        )
+        forget_loss_guard_enabled = (
+            allow_forget_guard and getattr(self.args, 'unlearn_forget_loss_guard', False)
+        )
+        forget_loss_min_gain = (
+            getattr(self.args, 'unlearn_forget_loss_min_gain', 0.0)
+            if allow_forget_guard
+            else 0.0
+        )
+        forget_loss_tolerance = (
+            getattr(self.args, 'unlearn_forget_loss_tolerance', 0.0)
+            if allow_forget_guard
+            else 0.0
+        )
+        ref_guard_enabled = ref_guard_ratio is not None and ref_guard_ratio > 0
+        global_guard_enabled = global_guard_max is not None and global_guard_max > 0
+
+        if update_sign_mode == 'auto' and allow_direction_check:
+            direction_check_enabled = True
+        elif update_sign_mode == 'auto':
+            update_sign_mode = 'positive'
+
+        sign_multiplier = -1.0 if update_sign_mode == 'negative' else 1.0
+        step_scale = (scale * sign_multiplier) / unlearn_num_steps
+        step_update_l2_norm = scaled_update_l2_norm_after / unlearn_num_steps
+        step_update_max_abs = scaled_update_max_abs_after / unlearn_num_steps
+        ref_loss_before_guard = None
+        ref_loss_after_last_accepted = None
+        global_loss_after_last_accepted = None
+        forget_loss_before_guard = None
+        forget_loss_after_last_accepted = None
+        forget_guard_loader = None
+        guard_step_records = []
+        guard_stop_reason = 'completed'
+
+        if ref_guard_enabled:
+            if ref_loader is None and reference_batch is None:
+                print(f"[{method_label}] Reference loss guard disabled because no reference data is available.")
+                ref_guard_enabled = False
+            else:
+                ref_loss_before_guard = self._compute_guard_reference_loss_value(ref_loader, reference_batch)
+                if ref_loss_before_guard is None:
+                    print(f"[{method_label}] Reference loss guard disabled because reference loss is unavailable.")
+                    ref_guard_enabled = False
+                else:
+                    print(
+                        f"[{method_label}] Reference loss guard: "
+                        f"base={ref_loss_before_guard:.6f}, ratio={ref_guard_ratio:.4f}, "
+                        f"limit={ref_loss_before_guard * ref_guard_ratio:.6f}"
+                    )
+
+        if global_guard_enabled:
+            print(f"[{method_label}] Global loss guard: max={global_guard_max:.6f}")
+
+        if direction_check_enabled or forget_loss_guard_enabled:
+            forget_guard_loader = self._build_forget_guard_loader(target_client)
+            self.experiment_metrics['unlearn_forget_guard_sample_size'] = len(forget_guard_loader.dataset)
+        else:
+            self.experiment_metrics['unlearn_forget_guard_sample_size'] = 0
+
+        if direction_check_enabled:
+            params_before_direction_probe = [param.detach().clone() for param in params]
+            direction_record, direction_records = self._probe_unlearning_update_direction(
+                params=params,
+                params_before_probe=params_before_direction_probe,
+                updates=updates,
+                scale=scale,
+                forget_guard_loader=forget_guard_loader,
+                global_guard_max=global_guard_max,
+                global_guard_enabled=global_guard_enabled,
+            )
+            self.experiment_metrics['unlearn_direction_probe_records'] = direction_records
+            self.experiment_metrics['unlearn_best_probe_update_sign'] = direction_record['sign']
+            self.experiment_metrics['unlearn_best_probe_direction_forget_delta'] = direction_record[
+                'forget_loss_delta_probe'
+            ]
+            self.experiment_metrics['unlearn_best_probe_direction_global_loss_after'] = direction_record[
+                'global_loss_after_probe'
+            ]
+            if getattr(self.args, 'unlearn_update_sign', 'positive') == 'auto':
+                sign_multiplier = direction_record['sign_multiplier']
+                step_scale = (scale * sign_multiplier) / unlearn_num_steps
+                self.experiment_metrics['unlearn_selected_update_sign'] = direction_record['sign']
+                self.experiment_metrics['unlearn_selected_direction_forget_delta'] = direction_record[
+                    'forget_loss_delta_probe'
+                ]
+                self.experiment_metrics['unlearn_selected_direction_global_loss_after'] = direction_record[
+                    'global_loss_after_probe'
+                ]
+                print(f"[{method_label}] Auto-selected update sign: {direction_record['sign']}")
+            else:
+                configured_sign = 'negative' if sign_multiplier < 0 else 'positive'
+                self.experiment_metrics['unlearn_selected_update_sign'] = configured_sign
+                print(f"[{method_label}] Direction check kept configured update sign: {update_sign_mode}")
+        else:
+            self.experiment_metrics['unlearn_selected_update_sign'] = (
+                'negative' if sign_multiplier < 0 else 'positive'
+            )
+
+        if forget_loss_guard_enabled:
+            if forget_guard_loader is None:
+                forget_guard_loader = self._build_forget_guard_loader(target_client)
+                self.experiment_metrics['unlearn_forget_guard_sample_size'] = len(forget_guard_loader.dataset)
+
+            forget_loss_before_guard = self.eval_loss_on_loader(
+                forget_guard_loader,
+                desc='Unlearn Forget Guard Baseline',
+            )
+            if forget_loss_min_gain > 0:
+                forget_loss_limit = forget_loss_before_guard + forget_loss_min_gain
+                print(
+                    f"[{method_label}] Forget loss guard: "
+                    f"base={forget_loss_before_guard:.6f}, min_gain={forget_loss_min_gain:.6f}, "
+                    f"limit={forget_loss_limit:.6f}"
+                )
+            else:
+                forget_loss_limit = forget_loss_before_guard - forget_loss_tolerance
+                print(
+                    f"[{method_label}] Forget loss guard: "
+                    f"base={forget_loss_before_guard:.6f}, tolerance={forget_loss_tolerance:.6f}, "
+                    f"limit={forget_loss_limit:.6f}"
+                )
+        else:
+            forget_loss_limit = None
+
+        self.experiment_metrics['unlearn_num_steps'] = unlearn_num_steps
+        self.experiment_metrics['unlearn_ref_loss_guard_ratio'] = ref_guard_ratio
+        self.experiment_metrics['unlearn_global_loss_guard_max'] = global_guard_max
+        self.experiment_metrics['unlearn_update_sign_mode'] = update_sign_mode
+        self.experiment_metrics['unlearn_direction_check_enabled'] = direction_check_enabled
+        self.experiment_metrics['unlearn_forget_loss_guard_enabled'] = forget_loss_guard_enabled
+        self.experiment_metrics['unlearn_forget_loss_min_gain'] = forget_loss_min_gain
+        self.experiment_metrics['unlearn_forget_loss_tolerance'] = forget_loss_tolerance
+        self.experiment_metrics['unlearn_ref_loss_guard_enabled'] = ref_guard_enabled
+        self.experiment_metrics['unlearn_global_loss_guard_enabled'] = global_guard_enabled
+        self.experiment_metrics['unlearn_reference_loss_before_guard'] = ref_loss_before_guard
+        self.experiment_metrics['unlearn_forget_loss_before_guard'] = forget_loss_before_guard
+        self.experiment_metrics['unlearn_forget_loss_limit'] = forget_loss_limit
+        self.experiment_metrics['unlearn_requested_scale_after_clipping'] = scale
+        self.experiment_metrics['unlearn_step_scale'] = step_scale
+        self.experiment_metrics['unlearn_step_update_l2_norm'] = step_update_l2_norm
+        self.experiment_metrics['unlearn_step_update_max_abs'] = step_update_max_abs
+
+        params_before = [param.detach().clone() for param in params]
+        steps_attempted = 0
+        steps_accepted = 0
+
+        for step_idx in range(1, unlearn_num_steps + 1):
+            steps_attempted += 1
+            params_before_step = [param.detach().clone() for param in params]
+            self._apply_scaled_update(params, updates, alpha=step_scale)
+
+            step_record = {
+                'step': step_idx,
+                'accepted': True,
+                'step_scale': step_scale,
+                'step_update_l2_norm': step_update_l2_norm,
+            }
+            reject_reason = None
+
+            if ref_guard_enabled:
+                ref_loss_after_step = self._compute_guard_reference_loss_value(ref_loader, reference_batch)
+                ref_loss_limit = ref_loss_before_guard * ref_guard_ratio
+                step_record['reference_loss_after_step'] = ref_loss_after_step
+                step_record['reference_loss_limit'] = ref_loss_limit
+                if ref_loss_after_step is None:
+                    reject_reason = 'reference_loss_unavailable'
+                elif ref_loss_after_step > ref_loss_limit:
+                    reject_reason = 'reference_loss_guard'
+
+            if reject_reason is None and global_guard_enabled:
+                global_loss_after_step = self.eval_loss_on_loader(
+                    self.eval_loader,
+                    desc=f'Unlearn Guard Step {step_idx}/{unlearn_num_steps}',
+                )
+                step_record['global_loss_after_step'] = global_loss_after_step
+                step_record['global_loss_limit'] = global_guard_max
+                if global_loss_after_step > global_guard_max:
+                    reject_reason = 'global_loss_guard'
+
+            if reject_reason is None and forget_loss_guard_enabled:
+                forget_loss_after_step = self.eval_loss_on_loader(
+                    forget_guard_loader,
+                    desc=f'Unlearn Forget Guard Step {step_idx}/{unlearn_num_steps}',
+                )
+                step_record['forget_loss_after_step'] = forget_loss_after_step
+                step_record['forget_loss_limit'] = forget_loss_limit
+                step_record['forget_loss_delta_from_guard_base'] = (
+                    forget_loss_after_step - forget_loss_before_guard
+                    if forget_loss_before_guard is not None
+                    else None
+                )
+                if forget_loss_after_step is None:
+                    reject_reason = 'forget_loss_unavailable'
+                elif forget_loss_after_step < forget_loss_limit:
+                    reject_reason = 'forget_loss_guard'
+
+            if reject_reason is not None:
+                self._restore_params(params, params_before_step)
+                step_record['accepted'] = False
+                step_record['reject_reason'] = reject_reason
+                guard_stop_reason = reject_reason
+                guard_step_records.append(step_record)
+                print(f"[{method_label}] Step {step_idx}/{unlearn_num_steps} rejected: {reject_reason}.")
+                break
+
+            steps_accepted += 1
+            ref_loss_after_last_accepted = step_record.get(
+                'reference_loss_after_step',
+                ref_loss_after_last_accepted,
+            )
+            global_loss_after_last_accepted = step_record.get(
+                'global_loss_after_step',
+                global_loss_after_last_accepted,
+            )
+            forget_loss_after_last_accepted = step_record.get(
+                'forget_loss_after_step',
+                forget_loss_after_last_accepted,
+            )
+            guard_step_records.append(step_record)
+            print(f"[{method_label}] Step {step_idx}/{unlearn_num_steps} accepted.")
+            self.model.train()
+
+        delta_stats = self._param_delta_stats(params, params_before)
+        self.experiment_metrics['actual_param_delta_l2_norm'] = delta_stats['l2_norm']
+        self.experiment_metrics['actual_param_delta_max_abs'] = delta_stats['max_abs']
+        self.experiment_metrics['actual_param_delta_nonzero_tensors'] = delta_stats['nonzero_tensors']
+        self.experiment_metrics['unlearn_steps_attempted'] = steps_attempted
+        self.experiment_metrics['unlearn_steps_accepted'] = steps_accepted
+        self.experiment_metrics['unlearn_guard_stop_reason'] = guard_stop_reason
+        self.experiment_metrics['unlearn_guard_step_records'] = guard_step_records
+        self.experiment_metrics['unlearn_reference_loss_after_last_accepted'] = ref_loss_after_last_accepted
+        self.experiment_metrics['unlearn_global_loss_after_last_accepted'] = global_loss_after_last_accepted
+        self.experiment_metrics['unlearn_forget_loss_after_last_accepted'] = forget_loss_after_last_accepted
+        self.experiment_metrics['unlearn_applied_scale'] = step_scale * steps_accepted
+        self.experiment_metrics['unlearn_applied_update_l2_norm_estimate'] = step_update_l2_norm * steps_accepted
+        print(
+            f"[{method_label}] Actual parameter delta norm: "
+            f"L2={delta_stats['l2_norm']:.6e}, max_abs={delta_stats['max_abs']:.6e}, "
+            f"nonzero_tensors={delta_stats['nonzero_tensors']}/{delta_stats['num_tensors']}"
+        )
+        print(
+            f"[{method_label}] Step guard summary: "
+            f"accepted={steps_accepted}/{steps_attempted}, stop_reason={guard_stop_reason}"
+        )
+
+        return step_scale * steps_accepted
+
     def apply_fedhds_unlearning(self, forget_client_idx, client_list):
         print(f"--- [FedHDS Unlearning] Starting Process for Client {forget_client_idx} ---")
         use_retained_hessian = getattr(self.args, 'use_retained_hessian', False)
@@ -568,274 +879,95 @@ class Server(object):
         self.experiment_metrics['inverse_hvp_l2_norm'] = ihvp_stats['l2_norm']
         self.experiment_metrics['inverse_hvp_max_abs'] = ihvp_stats['max_abs']
 
-        scaled_update_l2_norm_before = ihvp_stats['l2_norm'] * abs(scale)
-        scaled_update_max_abs_before = ihvp_stats['max_abs'] * abs(scale)
-        max_update_norm = getattr(self.args, 'unlearn_max_update_norm', 0.0)
-        clip_enabled = max_update_norm is not None and max_update_norm > 0
-        clip_coefficient = 1.0
-
-        if clip_enabled and scaled_update_l2_norm_before > max_update_norm and scaled_update_l2_norm_before > 0:
-            clip_coefficient = max_update_norm / scaled_update_l2_norm_before
-            scale *= clip_coefficient
-
-        scaled_update_l2_norm_after = scaled_update_l2_norm_before * clip_coefficient
-        scaled_update_max_abs_after = scaled_update_max_abs_before * clip_coefficient
-
-        self.experiment_metrics['unlearn_eta'] = getattr(self.args, 'unlearn_eta', 1.0)
-        self.experiment_metrics['unlearn_max_update_norm'] = max_update_norm
-        self.experiment_metrics['update_clipping_enabled'] = clip_enabled
-        self.experiment_metrics['update_clip_applied'] = clip_coefficient < 1.0
-        self.experiment_metrics['update_clip_coefficient'] = clip_coefficient
-        self.experiment_metrics['scaled_update_l2_norm_before_clipping'] = scaled_update_l2_norm_before
-        self.experiment_metrics['scaled_update_l2_norm_after_clipping'] = scaled_update_l2_norm_after
-        self.experiment_metrics['scaled_update_max_abs_before_clipping'] = scaled_update_max_abs_before
-        self.experiment_metrics['scaled_update_max_abs_after_clipping'] = scaled_update_max_abs_after
-        self.experiment_metrics['scaled_update_l2_norm'] = scaled_update_l2_norm_after
-        self.experiment_metrics['scaled_update_max_abs'] = scaled_update_max_abs_after
-        print(
-            "[FedHDS] Scaled update norm: "
-            f"before_clip_L2={scaled_update_l2_norm_before:.6e}, "
-            f"after_clip_L2={scaled_update_l2_norm_after:.6e}, "
-            f"clip_coef={clip_coefficient:.6e}, "
-            f"after_clip_max_abs={scaled_update_max_abs_after:.6e}"
+        applied_scale = self._apply_precomputed_unlearning_updates(
+            params=params,
+            updates=inverse_hvp,
+            target_client=target_client,
+            scale=scale,
+            reference_batch=reference_batch,
+            ref_loader=ref_loader,
+            allow_clipping=True,
+            allow_direction_check=True,
+            allow_ref_guard=True,
+            allow_global_guard=True,
+            allow_forget_guard=True,
+            fixed_sign=None,
+            method_label='FedHDS',
         )
 
-        unlearn_num_steps = max(1, getattr(self.args, 'unlearn_num_steps', 1))
-        ref_guard_ratio = getattr(self.args, 'unlearn_ref_loss_guard_ratio', 0.0)
-        global_guard_max = getattr(self.args, 'unlearn_global_loss_guard_max', 0.0)
-        update_sign_mode = getattr(self.args, 'unlearn_update_sign', 'positive')
-        direction_check_enabled = getattr(self.args, 'unlearn_direction_check', False)
-        forget_loss_guard_enabled = getattr(self.args, 'unlearn_forget_loss_guard', False)
-        forget_loss_min_gain = getattr(self.args, 'unlearn_forget_loss_min_gain', 0.0)
-        forget_loss_tolerance = getattr(self.args, 'unlearn_forget_loss_tolerance', 0.0)
-        ref_guard_enabled = ref_guard_ratio is not None and ref_guard_ratio > 0
-        global_guard_enabled = global_guard_max is not None and global_guard_max > 0
-        if update_sign_mode == 'auto':
-            direction_check_enabled = True
-        sign_multiplier = -1.0 if update_sign_mode == 'negative' else 1.0
-        step_scale = (scale * sign_multiplier) / unlearn_num_steps
-        step_update_l2_norm = scaled_update_l2_norm_after / unlearn_num_steps
-        step_update_max_abs = scaled_update_max_abs_after / unlearn_num_steps
-        ref_loss_before_guard = None
-        ref_loss_after_last_accepted = None
-        global_loss_after_last_accepted = None
-        forget_loss_before_guard = None
-        forget_loss_after_last_accepted = None
-        forget_guard_loader = None
-        guard_step_records = []
-        guard_stop_reason = 'completed'
+        print(f'[FedHDS Unlearn] Newton-step completed. Applied scale = {applied_scale:.6e}')
+        torch.cuda.empty_cache()
 
-        if ref_guard_enabled:
-            ref_loss_before_guard = self._compute_guard_reference_loss_value(ref_loader, reference_batch)
-            if ref_loss_before_guard is None:
-                print("[FedHDS] Reference loss guard disabled because reference loss is unavailable.")
-                ref_guard_enabled = False
-            else:
-                print(
-                    "[FedHDS] Reference loss guard: "
-                    f"base={ref_loss_before_guard:.6f}, ratio={ref_guard_ratio:.4f}, "
-                    f"limit={ref_loss_before_guard * ref_guard_ratio:.6f}"
-                )
+    def apply_gradient_ascent_unlearning(self, forget_client_idx, client_list, use_guards=False):
+        print(f"--- [Gradient Ascent Unlearning] Starting Process for Client {forget_client_idx} ---")
 
-        if global_guard_enabled:
-            print(f"[FedHDS] Global loss guard: max={global_guard_max:.6f}")
+        target_client = next((client for client in client_list if client.idx == forget_client_idx), None)
+        if target_client is None:
+            print("[Error] Forget client not found.")
+            return
 
-        if direction_check_enabled or forget_loss_guard_enabled:
-            forget_guard_loader = self._build_forget_guard_loader(target_client)
-            self.experiment_metrics['unlearn_forget_guard_sample_size'] = len(forget_guard_loader.dataset)
-        else:
-            self.experiment_metrics['unlearn_forget_guard_sample_size'] = 0
-
-        if direction_check_enabled:
-            params_before_direction_probe = [param.detach().clone() for param in params]
-            direction_record, direction_records = self._probe_unlearning_update_direction(
-                params=params,
-                params_before_probe=params_before_direction_probe,
-                updates=inverse_hvp,
-                scale=scale,
-                forget_guard_loader=forget_guard_loader,
-                global_guard_max=global_guard_max,
-                global_guard_enabled=global_guard_enabled,
-            )
-            self.experiment_metrics['unlearn_direction_probe_records'] = direction_records
-            self.experiment_metrics['unlearn_best_probe_update_sign'] = direction_record['sign']
-            self.experiment_metrics['unlearn_best_probe_direction_forget_delta'] = direction_record[
-                'forget_loss_delta_probe'
-            ]
-            self.experiment_metrics['unlearn_best_probe_direction_global_loss_after'] = direction_record[
-                'global_loss_after_probe'
-            ]
-            if update_sign_mode == 'auto':
-                sign_multiplier = direction_record['sign_multiplier']
-                step_scale = (scale * sign_multiplier) / unlearn_num_steps
-                self.experiment_metrics['unlearn_selected_update_sign'] = direction_record['sign']
-                self.experiment_metrics['unlearn_selected_direction_forget_delta'] = direction_record[
-                    'forget_loss_delta_probe'
-                ]
-                self.experiment_metrics['unlearn_selected_direction_global_loss_after'] = direction_record[
-                    'global_loss_after_probe'
-                ]
-                print(f"[FedHDS] Auto-selected update sign: {direction_record['sign']}")
-            else:
-                configured_sign = 'negative' if sign_multiplier < 0 else 'positive'
-                self.experiment_metrics['unlearn_selected_update_sign'] = configured_sign
-                print(f"[FedHDS] Direction check kept configured update sign: {update_sign_mode}")
-        else:
-            self.experiment_metrics['unlearn_selected_update_sign'] = (
-                'negative' if sign_multiplier < 0 else 'positive'
-            )
-
-        if forget_loss_guard_enabled:
-            if forget_guard_loader is None:
-                forget_guard_loader = self._build_forget_guard_loader(target_client)
-                self.experiment_metrics['unlearn_forget_guard_sample_size'] = len(forget_guard_loader.dataset)
-
-            forget_loss_before_guard = self.eval_loss_on_loader(
-                forget_guard_loader,
-                desc='Unlearn Forget Guard Baseline',
-            )
-            if forget_loss_min_gain > 0:
-                forget_loss_limit = forget_loss_before_guard + forget_loss_min_gain
-                print(
-                    "[FedHDS] Forget loss guard: "
-                    f"base={forget_loss_before_guard:.6f}, min_gain={forget_loss_min_gain:.6f}, "
-                    f"limit={forget_loss_limit:.6f}"
-                )
-            else:
-                forget_loss_limit = forget_loss_before_guard - forget_loss_tolerance
-                print(
-                    "[FedHDS] Forget loss guard: "
-                    f"base={forget_loss_before_guard:.6f}, tolerance={forget_loss_tolerance:.6f}, "
-                    f"limit={forget_loss_limit:.6f}"
-                )
-        else:
-            forget_loss_limit = None
-
-        self.experiment_metrics['unlearn_num_steps'] = unlearn_num_steps
-        self.experiment_metrics['unlearn_ref_loss_guard_ratio'] = ref_guard_ratio
-        self.experiment_metrics['unlearn_global_loss_guard_max'] = global_guard_max
-        self.experiment_metrics['unlearn_update_sign_mode'] = update_sign_mode
-        self.experiment_metrics['unlearn_direction_check_enabled'] = direction_check_enabled
-        self.experiment_metrics['unlearn_forget_loss_guard_enabled'] = forget_loss_guard_enabled
-        self.experiment_metrics['unlearn_forget_loss_min_gain'] = forget_loss_min_gain
-        self.experiment_metrics['unlearn_forget_loss_tolerance'] = forget_loss_tolerance
-        self.experiment_metrics['unlearn_ref_loss_guard_enabled'] = ref_guard_enabled
-        self.experiment_metrics['unlearn_global_loss_guard_enabled'] = global_guard_enabled
-        self.experiment_metrics['unlearn_reference_loss_before_guard'] = ref_loss_before_guard
-        self.experiment_metrics['unlearn_forget_loss_before_guard'] = forget_loss_before_guard
-        self.experiment_metrics['unlearn_forget_loss_limit'] = forget_loss_limit
-        self.experiment_metrics['unlearn_requested_scale_after_clipping'] = scale
-        self.experiment_metrics['unlearn_step_scale'] = step_scale
-        self.experiment_metrics['unlearn_step_update_l2_norm'] = step_update_l2_norm
-        self.experiment_metrics['unlearn_step_update_max_abs'] = step_update_max_abs
-
-        params_before = [param.detach().clone() for param in params]
-        steps_attempted = 0
-        steps_accepted = 0
-
-        for step_idx in range(1, unlearn_num_steps + 1):
-            steps_attempted += 1
-            params_before_step = [param.detach().clone() for param in params]
-
-            with torch.no_grad():
-                for param, update in zip(params, inverse_hvp):
-                    param.data.add_(update.to(param.device), alpha=step_scale)
-
-            step_record = {
-                'step': step_idx,
-                'accepted': True,
-                'step_scale': step_scale,
-                'step_update_l2_norm': step_update_l2_norm,
-            }
-            reject_reason = None
-
-            if ref_guard_enabled:
-                ref_loss_after_step = self._compute_guard_reference_loss_value(ref_loader, reference_batch)
-                ref_loss_limit = ref_loss_before_guard * ref_guard_ratio
-                step_record['reference_loss_after_step'] = ref_loss_after_step
-                step_record['reference_loss_limit'] = ref_loss_limit
-                if ref_loss_after_step is None:
-                    reject_reason = 'reference_loss_unavailable'
-                elif ref_loss_after_step > ref_loss_limit:
-                    reject_reason = 'reference_loss_guard'
-
-            if reject_reason is None and global_guard_enabled:
-                global_loss_after_step = self.eval_loss_on_loader(
-                    self.eval_loader,
-                    desc=f'Unlearn Guard Step {step_idx}/{unlearn_num_steps}',
-                )
-                step_record['global_loss_after_step'] = global_loss_after_step
-                step_record['global_loss_limit'] = global_guard_max
-                if global_loss_after_step > global_guard_max:
-                    reject_reason = 'global_loss_guard'
-
-            if reject_reason is None and forget_loss_guard_enabled:
-                forget_loss_after_step = self.eval_loss_on_loader(
-                    forget_guard_loader,
-                    desc=f'Unlearn Forget Guard Step {step_idx}/{unlearn_num_steps}',
-                )
-                step_record['forget_loss_after_step'] = forget_loss_after_step
-                step_record['forget_loss_limit'] = forget_loss_limit
-                step_record['forget_loss_delta_from_guard_base'] = (
-                    forget_loss_after_step - forget_loss_before_guard
-                    if forget_loss_before_guard is not None
-                    else None
-                )
-                if forget_loss_after_step is None:
-                    reject_reason = 'forget_loss_unavailable'
-                elif forget_loss_after_step < forget_loss_limit:
-                    reject_reason = 'forget_loss_guard'
-
-            if reject_reason is not None:
-                self._restore_params(params, params_before_step)
-                step_record['accepted'] = False
-                step_record['reject_reason'] = reject_reason
-                guard_stop_reason = reject_reason
-                guard_step_records.append(step_record)
-                print(f"[FedHDS] Step {step_idx}/{unlearn_num_steps} rejected: {reject_reason}.")
-                break
-
-            steps_accepted += 1
-            ref_loss_after_last_accepted = step_record.get(
-                'reference_loss_after_step',
-                ref_loss_after_last_accepted,
-            )
-            global_loss_after_last_accepted = step_record.get(
-                'global_loss_after_step',
-                global_loss_after_last_accepted,
-            )
-            forget_loss_after_last_accepted = step_record.get(
-                'forget_loss_after_step',
-                forget_loss_after_last_accepted,
-            )
-            guard_step_records.append(step_record)
-            print(f"[FedHDS] Step {step_idx}/{unlearn_num_steps} accepted.")
-            self.model.train()
-
-        delta_stats = self._param_delta_stats(params, params_before)
-        self.experiment_metrics['actual_param_delta_l2_norm'] = delta_stats['l2_norm']
-        self.experiment_metrics['actual_param_delta_max_abs'] = delta_stats['max_abs']
-        self.experiment_metrics['actual_param_delta_nonzero_tensors'] = delta_stats['nonzero_tensors']
-        self.experiment_metrics['unlearn_steps_attempted'] = steps_attempted
-        self.experiment_metrics['unlearn_steps_accepted'] = steps_accepted
-        self.experiment_metrics['unlearn_guard_stop_reason'] = guard_stop_reason
-        self.experiment_metrics['unlearn_guard_step_records'] = guard_step_records
-        self.experiment_metrics['unlearn_reference_loss_after_last_accepted'] = ref_loss_after_last_accepted
-        self.experiment_metrics['unlearn_global_loss_after_last_accepted'] = global_loss_after_last_accepted
-        self.experiment_metrics['unlearn_forget_loss_after_last_accepted'] = forget_loss_after_last_accepted
-        self.experiment_metrics['unlearn_applied_scale'] = step_scale * steps_accepted
-        self.experiment_metrics['unlearn_applied_update_l2_norm_estimate'] = step_update_l2_norm * steps_accepted
-        print(
-            "[FedHDS] Actual parameter delta norm: "
-            f"L2={delta_stats['l2_norm']:.6e}, max_abs={delta_stats['max_abs']:.6e}, "
-            f"nonzero_tensors={delta_stats['nonzero_tensors']}/{delta_stats['num_tensors']}"
+        forget_loader = target_client.get_full_train_loader(
+            shuffle=False,
+            sample_limit=getattr(self.args, 'unlearn_grad_sample_size', 0),
         )
+        print(f"[GA] Forget gradient sample size: {len(forget_loader.dataset)}")
+        self.experiment_metrics['forget_gradient_sample_size'] = len(forget_loader.dataset)
+        self.experiment_metrics['requested_hessian_reference_mode'] = 'gradient-ascent'
+        self.experiment_metrics['effective_hessian_reference_mode'] = 'gradient-ascent'
+        self.experiment_metrics['retained_reference_set_size'] = 0
+        self.experiment_metrics['lissa_depth'] = 0
+        self.experiment_metrics['lissa_damping'] = 0.0
+
+        if getattr(self.model, 'is_gradient_checkpointing', False):
+            print("[GA] Disabling gradient checkpointing for autograd.grad-based unlearning.")
+            self.model.gradient_checkpointing_disable()
+            self.experiment_metrics['gradient_checkpointing_disabled_for_unlearning'] = True
+        else:
+            self.experiment_metrics['gradient_checkpointing_disabled_for_unlearning'] = False
+
+        if hasattr(self.model, 'config'):
+            self.model.config.use_cache = False
+
+        self.model.train()
+        params = [param for param in self.model.parameters() if param.requires_grad]
+        grads, _ = self._compute_average_forget_gradients(forget_loader, params)
+        if grads is None:
+            print("[Error] Forget client data loader is empty.")
+            return
+
+        grad_stats = self._tensor_list_stats(grads)
+        self.experiment_metrics['forget_gradient_l2_norm'] = grad_stats['l2_norm']
+        self.experiment_metrics['forget_gradient_max_abs'] = grad_stats['max_abs']
+        self.experiment_metrics['forget_gradient_nonzero_tensors'] = grad_stats['nonzero_tensors']
         print(
-            "[FedHDS] Step guard summary: "
-            f"accepted={steps_accepted}/{steps_attempted}, stop_reason={guard_stop_reason}"
+            "[GA] Forget gradient norm: "
+            f"L2={grad_stats['l2_norm']:.6e}, max_abs={grad_stats['max_abs']:.6e}, "
+            f"nonzero_tensors={grad_stats['nonzero_tensors']}/{grad_stats['num_tensors']}"
         )
 
-        print(f'[FedHDS Unlearn] Newton-step completed. Applied scale = {step_scale * steps_accepted:.6e}')
+        scale = 1.0 / (self.args.num_clients - 1) if self.args.num_clients > 1 else 1.0
+        scale *= getattr(self.args, 'unlearn_eta', 1.0)
+
+        if getattr(self.args, 'unlearn_ref_loss_guard_ratio', 0.0) > 0:
+            print("[GA] Reference loss guard is disabled for gradient-ascent unlearning.")
+
+        applied_scale = self._apply_precomputed_unlearning_updates(
+            params=params,
+            updates=grads,
+            target_client=target_client,
+            scale=scale,
+            reference_batch=None,
+            ref_loader=None,
+            allow_clipping=use_guards,
+            allow_direction_check=False,
+            allow_ref_guard=False,
+            allow_global_guard=use_guards,
+            allow_forget_guard=use_guards,
+            fixed_sign='positive',
+            method_label='GA',
+        )
+
+        print(f'[GA Unlearn] Gradient-ascent step completed. Applied scale = {applied_scale:.6e}')
         torch.cuda.empty_cache()
 
     def eval_loss(self, cur_round):

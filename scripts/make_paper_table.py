@@ -11,6 +11,8 @@ NUMERIC_COLUMNS = [
     'global_loss_after_unlearning',
     'forget_client_loss_before_unlearning',
     'forget_client_loss_after_unlearning',
+    'mia_loss_auc',
+    'mia_loss_tpr_at_fpr001',
     'unlearning_time_sec',
     'actual_param_delta_l2_norm',
     'unlearn_applied_update_l2_norm_estimate',
@@ -28,9 +30,12 @@ NUMERIC_COLUMNS = [
 
 OUTPUT_COLUMNS = [
     'source',
+    'method',
     'setting',
     'hessian',
     'forget_loss',
+    'mia_auc',
+    'mia_tpr_at_fpr001',
     'final_global_loss',
     'update_l2',
     'steps',
@@ -131,9 +136,24 @@ def _forget_loss(row):
 def _steps(row):
     accepted = row.get('unlearn_steps_accepted')
     attempted = row.get('unlearn_steps_attempted')
+    if pd.isna(attempted):
+        attempted = row.get('unlearn_num_steps')
     if pd.notna(accepted) and pd.notna(attempted):
         return f'{int(float(accepted))}/{int(float(attempted))}'
     return '-'
+
+
+def _method(row):
+    method = str(_get(row, 'unlearning_method', '')).strip()
+    if method and method != 'nan':
+        return method
+
+    hessian = str(_get(row, 'hessian_mode', '')).strip()
+    if hessian in ('retrain-from-scratch',):
+        return 'retrain'
+    if hessian in ('', 'nan'):
+        return 'training_only'
+    return 'second_order'
 
 
 def _note(row):
@@ -174,9 +194,12 @@ def build_table(summary_csv):
 
         rows.append({
             'source': source,
+            'method': _method(row),
             'setting': _setting(row),
             'hessian': str(_get(row, 'hessian_mode', 'none')).strip() or 'none',
             'forget_loss': _forget_loss(row),
+            'mia_auc': _fmt(row.get('mia_loss_auc')),
+            'mia_tpr_at_fpr001': _fmt(row.get('mia_loss_tpr_at_fpr001')),
             'final_global_loss': _fmt(_final_global_loss(row)),
             'update_l2': _fmt(_update_l2(row)),
             'steps': _steps(row),
@@ -196,14 +219,17 @@ def write_csv(rows, output_path):
 
 def write_markdown(rows, output_path):
     with output_path.open('w', encoding='utf-8') as file:
-        file.write('| Source | Setting | Hessian | Forget loss | Final global loss | Update L2 | Steps | Time (s) | Note |\n')
-        file.write('|---|---|---|---:|---:|---:|---:|---:|---|\n')
+        file.write('| Source | Method | Setting | Hessian | Forget loss | MIA AUC | MIA TPR@1%FPR | Final global loss | Update L2 | Steps | Time (s) | Note |\n')
+        file.write('|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n')
         for row in rows:
             values = [
                 row['source'],
+                row['method'],
                 row['setting'],
                 row['hessian'],
                 row['forget_loss'],
+                row['mia_auc'],
+                row['mia_tpr_at_fpr001'],
                 row['final_global_loss'],
                 row['update_l2'],
                 row['steps'],

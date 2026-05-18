@@ -6,7 +6,9 @@ import time
 import numpy as np
 import torch
 
+from cli_config import build_arg_parser
 from m_utils import resolve_amp_dtype
+from unlearning_methods import get_unlearning_method_spec
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -20,97 +22,9 @@ def setup_seed(seed):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-
-    # federation
-    parser.add_argument('--num_clients', type=int, default=20)
-    parser.add_argument('-k', '--k', dest='k', type=float, default=0.05)
-    parser.add_argument('--rounds', type=int, default=40)
-    parser.add_argument('--batch_or_epoch', type=str, default='batch', choices=['epoch', 'batch'])
-    parser.add_argument('--local_step', type=int, default=1)
-    parser.add_argument('--equal_weight', default=False, action='store_true')
-
-    # data
-    parser.add_argument('--dataset', type=str, default='dolly')
-    parser.add_argument('--data_path', type=str, default='')
-    parser.add_argument('--data_sample', type=float, default=1.0)
-    parser.add_argument('--iid', type=str, default='0')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--max_length', type=int, default=128)
-    parser.add_argument('--zeroshot', default=True, action='store_true')
-    parser.add_argument('--zerotask', default='7', type=str)
-    parser.add_argument('--split', type=str, default='[0.98, 0.01, 0.01]')
-    parser.add_argument('--train_eval_ratio', default='[0.99, 0.01]', type=str)
-    parser.add_argument('--use_prompts', default=False, action='store_true')
-
-    # filtering (FedHDS)
-    parser.add_argument('--filtering', action='store_true', default=False)
-    parser.add_argument('--feature_layer', default='-1', type=str)
-    parser.add_argument('--compound_dim', default=2, type=int)
-    parser.add_argument('--feature_token', default='avg', type=str, choices=['avg', 'last'])
-    parser.add_argument('--clustering_score', default='ch', type=str, choices=['ch', 'sc', 'db'])
-    parser.add_argument('--clustering', type=str, default='kmeans', choices=['kmeans', 'hdbscan'])
-    parser.add_argument('--n_cluster', type=int, default=7)
-    parser.add_argument('--kernel_ratio', type=float, default=1.0)
-    parser.add_argument('--filtering_model', type=str, default='same')
-    parser.add_argument('--filtering_sample_limit', type=int, default=50)
-    parser.add_argument('--dp_noise', type=float, default=0.0)
-    parser.add_argument('--min_cluster', type=int, default=2)
-
-    # model
-    parser.add_argument('--model', type=str, default='Qwen/Qwen2-0.5B')
-    parser.add_argument('--peft', action='store_true', default=False)
-    parser.add_argument('--peft_method', default='lora', type=str, choices=['lora', 'prefix', 'p-tuning', 'prompt'])
-
-    # training
-    parser.add_argument('--optimizer', default='adam', choices=['adam', 'sgd'])
-    parser.add_argument('--lr', type=float, default=2e-4)
-    parser.add_argument('--lr_decay', type=float, default=1.0)
-    parser.add_argument('--grad_clip', type=float, default=-100.0)
-    parser.add_argument('--amp_dtype', type=str, default='auto', choices=['auto', 'bf16', 'fp16'])
-
-    # environment
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--log', default=False, action='store_true')
-    parser.add_argument('--log_root', default='')
-    parser.add_argument('--seed', default=42, type=int)
-
-    # evaluation
-    parser.add_argument('--eval_metrics', default='none', type=str)
-    parser.add_argument('--generate_eval', default='rouge', type=str, choices=['rouge', 'bleu'])
-    parser.add_argument('--eval_subsampling', default=False, action='store_true')
-    parser.add_argument('--full_evaluation', default=False, action='store_true')
-    parser.add_argument('--start_eval_epoch', default=30, type=int)
-    parser.add_argument('--eval_interval', default=1, type=int)
-    parser.add_argument('--loss', default=False, action='store_true')
-
-    # ckpt
-    parser.add_argument('--save', default=False, action='store_true')
-
-    # FedHDS unlearning
-    parser.add_argument('--use_fedhds_unlearn', default=False, action='store_true')
-    parser.add_argument('--use_retained_hessian', default=False, action='store_true')
-    parser.add_argument('--forget_client_idx', type=int, default=-1)
-    parser.add_argument('--hessian_ref_per_client', type=int, default=2)
-    parser.add_argument('--unlearn_eta', type=float, default=1.0)
-    parser.add_argument('--unlearn_max_update_norm', type=float, default=0.0)
-    parser.add_argument('--unlearn_num_steps', type=int, default=1)
-    parser.add_argument('--unlearn_ref_loss_guard_ratio', type=float, default=0.0)
-    parser.add_argument('--unlearn_global_loss_guard_max', type=float, default=0.0)
-    parser.add_argument('--unlearn_update_sign', type=str, default='positive', choices=['positive', 'negative', 'auto'])
-    parser.add_argument('--unlearn_direction_check', default=False, action='store_true')
-    parser.add_argument('--unlearn_forget_loss_guard', default=False, action='store_true')
-    parser.add_argument('--unlearn_forget_loss_min_gain', type=float, default=0.0)
-    parser.add_argument('--unlearn_forget_loss_tolerance', type=float, default=0.0)
-    parser.add_argument('--unlearn_forget_guard_sample_size', type=int, default=0)
-    parser.add_argument('--lissa_depth', type=int, default=1)
-    parser.add_argument('--lissa_damping', type=float, default=0.01)
-    parser.add_argument('--unlearn_grad_sample_size', type=int, default=0)
-
-    # retrain baseline
-    parser.add_argument('--retrain_exclude_client', type=int, default=-1)
-
+    parser = build_arg_parser()
     args = parser.parse_args()
+    method_spec = get_unlearning_method_spec(args.unlearn_method)
     time_stamp = str(time.time())
 
     supported_datasets = {'dolly', 'instruct'}
@@ -123,6 +37,8 @@ if __name__ == '__main__':
         )
     if args.use_retained_hessian and not args.use_fedhds_unlearn:
         raise ValueError("--use_retained_hessian requires --use_fedhds_unlearn.")
+    if args.use_retained_hessian and not method_spec.allow_retained_hessian:
+        raise ValueError(f"--use_retained_hessian is incompatible with --unlearn_method {args.unlearn_method}.")
     if args.use_fedhds_unlearn and not (0 <= args.forget_client_idx < args.num_clients):
         raise ValueError("--forget_client_idx must be in [0, num_clients) when unlearning is enabled.")
     if args.hessian_ref_per_client < 1:
@@ -310,7 +226,7 @@ if __name__ == '__main__':
         print(f"[RETRAIN BASELINE] Heldout client {args.retrain_exclude_client} loss: {heldout_loss:.4f}")
 
     elif args.use_fedhds_unlearn and args.forget_client_idx >= 0:
-        print(f"\n>>> Starting FedHDS Precise Unlearning for Client {args.forget_client_idx} <<<")
+        print(f"\n>>> Starting {args.unlearn_method} Unlearning for Client {args.forget_client_idx} <<<")
         torch.cuda.empty_cache()
 
         forget_eval_loader = client_list[args.forget_client_idx].get_full_train_loader(shuffle=False)
@@ -323,15 +239,27 @@ if __name__ == '__main__':
             'forget_client_idx': args.forget_client_idx,
             'forget_client_num_samples': len(forget_eval_loader.dataset),
             'forget_client_loss_before_unlearning': forget_loss_before,
-            'hessian_reference_mode': 'retained-set' if args.use_retained_hessian else 'forget-batch',
+            'hessian_reference_mode': (
+                'retained-set'
+                if method_spec.use_second_order and args.use_retained_hessian
+                else ('forget-batch' if method_spec.use_second_order else 'gradient-ascent')
+            ),
+            'unlearning_method': args.unlearn_method,
         })
         print(f"[UNLEARN CHECK] Forget client loss before unlearning: {forget_loss_before:.4f}")
 
         unlearn_start_time = time.time()
-        server.apply_fedhds_unlearning(
-            forget_client_idx=args.forget_client_idx,
-            client_list=client_list,
-        )
+        if method_spec.use_second_order:
+            server.apply_fedhds_unlearning(
+                forget_client_idx=args.forget_client_idx,
+                client_list=client_list,
+            )
+        else:
+            server.apply_gradient_ascent_unlearning(
+                forget_client_idx=args.forget_client_idx,
+                client_list=client_list,
+                use_guards=method_spec.allow_guards,
+            )
         unlearn_elapsed = time.time() - unlearn_start_time
         server.experiment_metrics['unlearning_time_sec'] = unlearn_elapsed
         print(f"[UNLEARN CHECK] Unlearning time: {unlearn_elapsed:.2f}s")
