@@ -1,0 +1,216 @@
+import argparse
+import csv
+from pathlib import Path
+
+import pandas as pd
+
+
+NUMERIC_COLUMNS = [
+    'final_global_loss',
+    'global_loss_before_unlearning',
+    'global_loss_after_unlearning',
+    'forget_client_loss_before_unlearning',
+    'forget_client_loss_after_unlearning',
+    'unlearning_time_sec',
+    'actual_param_delta_l2_norm',
+    'unlearn_applied_update_l2_norm_estimate',
+    'unlearn_eta',
+    'unlearn_max_update_norm',
+    'unlearn_num_steps',
+    'unlearn_steps_attempted',
+    'unlearn_steps_accepted',
+    'unlearn_global_loss_guard_max',
+]
+
+OUTPUT_COLUMNS = [
+    'source',
+    'setting',
+    'hessian',
+    'forget_loss',
+    'final_global_loss',
+    'update_l2',
+    'steps',
+    'unlearning_time_sec',
+    'note',
+]
+
+
+def _to_numeric(df):
+    for column in NUMERIC_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors='coerce')
+
+
+def _fmt(value, digits=4, empty='-'):
+    if pd.isna(value):
+        return empty
+    return f'{float(value):.{digits}f}'
+
+
+def _get(row, key, default=''):
+    value = row.get(key, default)
+    if pd.isna(value):
+        return default
+    return value
+
+
+def _final_global_loss(row):
+    for key in ('global_loss_after_unlearning', 'final_global_loss', 'round2_global_loss'):
+        value = row.get(key)
+        if pd.notna(value):
+            return value
+    return None
+
+
+def _update_l2(row):
+    for key in (
+        'actual_param_delta_l2_norm',
+        'unlearn_applied_update_l2_norm_estimate',
+        'scaled_update_l2_norm_after_clipping',
+    ):
+        value = row.get(key)
+        if pd.notna(value):
+            return value
+    return None
+
+
+def _setting(row):
+    parts = []
+    eta = row.get('unlearn_eta')
+    if pd.notna(eta):
+        parts.append(f'eta={_fmt(eta, digits=4)}')
+
+    max_norm = row.get('unlearn_max_update_norm')
+    if pd.notna(max_norm) and float(max_norm) > 0:
+        parts.append(f'max_norm={_fmt(max_norm, digits=3)}')
+
+    steps = row.get('unlearn_num_steps')
+    if pd.notna(steps) and int(float(steps)) > 1:
+        parts.append(f'steps={int(float(steps))}')
+
+    guard = row.get('unlearn_global_loss_guard_max')
+    if pd.notna(guard) and float(guard) > 0:
+        parts.append(f'global_guard={_fmt(guard, digits=3)}')
+
+    if parts:
+        return ', '.join(parts)
+
+    hessian = str(_get(row, 'hessian_mode', '')).strip()
+    if hessian in ('', 'nan'):
+        return 'training only'
+    return 'default'
+
+
+def _forget_loss(row):
+    before = row.get('forget_client_loss_before_unlearning')
+    after = row.get('forget_client_loss_after_unlearning')
+    if pd.notna(before) and pd.notna(after):
+        return f'{_fmt(before)} -> {_fmt(after)}'
+    return '-'
+
+
+def _steps(row):
+    accepted = row.get('unlearn_steps_accepted')
+    attempted = row.get('unlearn_steps_attempted')
+    if pd.notna(accepted) and pd.notna(attempted):
+        return f'{int(float(accepted))}/{int(float(attempted))}'
+    return '-'
+
+
+def _note(row):
+    mode = str(_get(row, 'hessian_mode', '')).strip()
+    final_loss = _final_global_loss(row)
+    forget_before = row.get('forget_client_loss_before_unlearning')
+    forget_after = row.get('forget_client_loss_after_unlearning')
+    guard_reason = str(_get(row, 'unlearn_guard_stop_reason', '')).strip()
+
+    if mode in ('', 'nan'):
+        return 'utility baseline'
+    if guard_reason and guard_reason not in ('completed', 'nan'):
+        return f'guard stopped by {guard_reason}'
+    if pd.notna(final_loss) and float(final_loss) >= 5:
+        return 'unstable in this setting'
+    if pd.notna(forget_before) and pd.notna(forget_after):
+        gain = float(forget_after) - float(forget_before)
+        if gain > 0:
+            return 'forget loss increased'
+    return ''
+
+
+def build_table(summary_csv):
+    df = pd.read_csv(summary_csv)
+    _to_numeric(df)
+
+    rows = []
+    for _, row in df.iterrows():
+        source = str(_get(row, 'group', '')).strip()
+        if not source:
+            source = str(_get(row, 'path', '')).strip()
+
+        rows.append({
+            'source': source,
+            'setting': _setting(row),
+            'hessian': str(_get(row, 'hessian_mode', 'none')).strip() or 'none',
+            'forget_loss': _forget_loss(row),
+            'final_global_loss': _fmt(_final_global_loss(row)),
+            'update_l2': _fmt(_update_l2(row)),
+            'steps': _steps(row),
+            'unlearning_time_sec': _fmt(row.get('unlearning_time_sec'), digits=2),
+            'note': _note(row),
+        })
+
+    return rows
+
+
+def write_csv(rows, output_path):
+    with output_path.open('w', encoding='utf-8', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_markdown(rows, output_path):
+    with output_path.open('w', encoding='utf-8') as file:
+        file.write('| Source | Setting | Hessian | Forget loss | Final global loss | Update L2 | Steps | Time (s) | Note |\n')
+        file.write('|---|---|---|---:|---:|---:|---:|---:|---|\n')
+        for row in rows:
+            values = [
+                row['source'],
+                row['setting'],
+                row['hessian'],
+                row['forget_loss'],
+                row['final_global_loss'],
+                row['update_l2'],
+                row['steps'],
+                row['unlearning_time_sec'],
+                row['note'],
+            ]
+            safe_values = [str(value).replace('|', '/') for value in values]
+            file.write('| ' + ' | '.join(safe_values) + ' |\n')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Create paper-ready CSV/Markdown tables from summary.csv.')
+    parser.add_argument('summary_csv', help='Path to summary.csv generated by summarize_experiments.py.')
+    parser.add_argument('--output-prefix', default='', help='Output prefix. Defaults to <summary parent>/paper_table.')
+    args = parser.parse_args()
+
+    summary_path = Path(args.summary_csv).resolve()
+    if not summary_path.exists():
+        raise FileNotFoundError(f'Summary CSV does not exist: {summary_path}')
+
+    output_prefix = Path(args.output_prefix).resolve() if args.output_prefix else summary_path.parent / 'paper_table'
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = build_table(summary_path)
+    csv_path = output_prefix.with_suffix('.csv')
+    md_path = output_prefix.with_suffix('.md')
+    write_csv(rows, csv_path)
+    write_markdown(rows, md_path)
+
+    print(f'Wrote {len(rows)} rows to {csv_path}')
+    print(f'Wrote {len(rows)} rows to {md_path}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,68 @@
+================================================================================
+Retrain Baseline Command
+================================================================================
+
+Purpose
+- Run the retrain-from-scratch gold-standard baseline for client-level forgetting.
+- This baseline excludes client 0 from training and evaluates the held-out client
+  after training.
+
+Important
+- Use `-k 0.2`.
+- Use `--batch_or_epoch batch`.
+- Do not rely on the old default for `batch_or_epoch`.
+- The previous unstable retrain runs omitted `--batch_or_epoch batch`, which made
+  `local_step=2` behave like 2 local epochs instead of 2 local batches.
+
+Recommended command
+```bash
+python3 main.py \
+  --model /root/autodl-tmp/models/Qwen2-0.5B-ms \
+  --dataset dolly \
+  --data_sample 0.4 \
+  --rounds 20 \
+  --num_clients 20 \
+  -k 0.2 \
+  --batch_or_epoch batch \
+  --local_step 2 \
+  --batch_size 1 \
+  --max_length 64 \
+  --seed 42 \
+  --lr 5e-5 \
+  --retrain_exclude_client 0 \
+  --log \
+  --loss \
+  --amp_dtype fp16 \
+  --grad_clip 1.0
+```
+
+If this is still unstable
+```bash
+python3 main.py \
+  --model /root/autodl-tmp/models/Qwen2-0.5B-ms \
+  --dataset dolly \
+  --data_sample 0.4 \
+  --rounds 20 \
+  --num_clients 20 \
+  -k 0.2 \
+  --batch_or_epoch batch \
+  --local_step 2 \
+  --batch_size 1 \
+  --max_length 64 \
+  --seed 42 \
+  --lr 1e-5 \
+  --retrain_exclude_client 0 \
+  --log \
+  --loss \
+  --amp_dtype fp16 \
+  --grad_clip 1.0
+```
+
+Expected outputs
+- `eval_history[-1]`: retrain final global loss
+- `experiment_metrics.forget_client_loss_before_unlearning`: held-out client loss
+- `experiment_metrics.retrain_exclude_client_idx`: excluded client id
+
+Paper usage
+- Compare `retrain baseline` vs `forget-batch` vs retained-Hessian / retained-negative.
+- Treat retrain as the gold-standard reference, not as the main method.

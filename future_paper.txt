@@ -1,0 +1,388 @@
+Future Paper Plan: From Current FedHDS Hessian Unlearning Study to a Higher-Level Journal Paper
+
+一、当前小论文与未来期刊论文的关系
+
+当前工作应先按既定计划收口，目标是完成一篇研究生小论文或毕业论文核心实验章节。当前版本的重点是：
+
+```text
+在 FedHDS 联邦指令微调场景中，系统分析 Hessian-based unlearning 的方向、reference set 和 guard 机制，并证明 retained-set guarded update 能提供更可控的 utility-preserving unlearning trade-off。
+```
+
+未来中高水平期刊论文不应简单堆叠当前实验，而应把当前工作作为第一版核心机制，进一步补足理论、外部泛化、隐私攻击评估和真实联邦场景。
+
+当前版本的定位：
+
+```text
+核心机制验证：retained-set Hessian + negative-direction update + direction probing + forget-loss guard + global-loss guard
+主要证据：完整消融、2 x 2 模型/数据规模泛化、seed robustness
+适合目标：硕士小论文、毕业论文核心章节、普通研究型论文初版
+```
+
+未来版本的定位：
+
+```text
+系统性研究：federated LLM unlearning 中 Hessian reference、update direction、privacy risk 和 utility preservation 的统一框架
+主要证据：理论解释、多数据集、多模型家族、多隐私攻击、多真实联邦设置
+适合目标：中高水平期刊或更完整的研究论文
+```
+
+二、未来论文的核心研究问题
+
+未来论文应围绕一个更高层次的问题展开：
+
+```text
+How can Hessian-based unlearning in federated LLM fine-tuning improve forgetting while provably and empirically preserving global utility and reducing privacy leakage?
+```
+
+中文表述：
+
+```text
+在联邦大模型微调中，如何设计 Hessian-based unlearning，使其在增强遗忘效果的同时，可解释、可控地保持全局模型性能，并降低隐私泄露风险？
+```
+
+当前工作已经观察到的关键现象：
+
+1. forget-batch Hessian 有时能增强 forget loss，但容易破坏 global utility。
+2. retained-set Hessian 更有利于 utility preservation，但默认 update direction 可能降低 forget loss。
+3. negative-direction update、direction probing 和 guard 约束可以缓解 retained-set Hessian 的方向问题。
+4. global-loss guard 和 forget-loss guard 能把遗忘更新从“盲目二阶更新”变成“受约束的 utility-preserving update”。
+
+未来论文需要把这些经验现象上升为更一般的理论解释和系统验证。
+
+三、理论扩展方向
+
+未来需要把当前经验方法形式化。理论部分不一定一开始就追求很强的定理，但至少要建立清楚的优化视角。
+
+建议从以下角度展开：
+
+```text
+目标函数：
+minimize retained/global utility degradation while maximizing forgetting on deleted/forget clients.
+
+约束形式：
+forget loss should not decrease;
+retained/global loss should not exceed a bounded guard threshold.
+
+二阶近似：
+use Hessian or inverse-Hessian approximations to estimate parameter updates.
+
+reference set choice:
+forget-batch Hessian approximates curvature around the forget objective;
+retained-set Hessian approximates curvature around the retained utility objective.
+
+direction selection:
+the effective unlearning direction should be selected by directional derivatives or small-step probing on forget and retained objectives.
+
+trust-region view:
+update norm clipping and global-loss guard can be interpreted as trust-region constraints.
+```
+
+可以尝试形成的理论命题：
+
+1. Forget-batch Hessian 的更新方向可能在 retained/global objective 上产生较大的二阶损失增长。
+2. Retained-set Hessian 的二阶近似更适合控制 retained loss，但需要方向选择才能避免 forget objective 反向优化。
+3. 在 Lipschitz-smooth 或局部二阶近似条件下，global-loss guard 可以上界 retained/global utility degradation。
+4. Direction probing 可以视为对候选 Hessian update sign 的局部模型选择，降低错误方向更新的概率。
+5. Norm clipping / trust region 可以限制二阶近似失效时的损伤。
+
+可能的理论框架：
+
+```text
+Constrained bi-objective optimization
+Trust-region Newton update
+Projected or guarded Hessian update
+Directional derivative based sign selection
+Utility-preserving unlearning bound under local smoothness
+```
+
+未来理论部分的目标不是证明方法在所有条件下最优，而是解释：
+
+```text
+为什么 retained-set Hessian 更适合 utility preservation；
+为什么 direction sign 会影响 forgetting；
+为什么 guard 机制能降低 catastrophic utility degradation；
+为什么 forget-batch Hessian 和 retained-set Hessian 呈现不同 trade-off。
+```
+
+四、多数据集扩展
+
+当前工作主要使用 Databricks Dolly 15k。未来期刊版本需要至少 3 个数据集，最好覆盖一般指令数据和领域数据。
+
+建议数据集：
+
+```text
+Databricks Dolly 15k
+Alpaca / Stanford Alpaca
+OpenAssistant / OASST
+ShareGPT-style instruction data
+MedAlpaca or medical instruction subset
+Finance/legal instruction data if a domain-specific angle is needed
+```
+
+数据集设计建议：
+
+1. 保留 Dolly 作为与当前论文连续的主数据集。
+2. 增加 Alpaca/OASST 作为通用 instruction-following 外部验证。
+3. 如果想提高论文特色，可以增加一个医疗、金融或法律领域数据集，用于强调 sensitive-client unlearning。
+4. 每个数据集不一定都跑完整 9 组，可以采用“完整消融 + 核心配置复现”的层级设计。
+
+推荐实验层级：
+
+```text
+Dolly：完整消融 + 规模泛化 + seed robustness
+Alpaca/OASST：核心 5 组验证
+领域数据集：核心 3 组验证 + privacy attack
+```
+
+五、多模型家族扩展
+
+当前工作使用 Qwen/Qwen2.5。未来期刊版本需要说明方法不只是 Qwen family 的偶然现象。
+
+建议模型家族：
+
+```text
+Qwen / Qwen2.5
+TinyLlama / Llama family
+OPT
+Pythia
+Phi
+```
+
+模型规模建议：
+
+```text
+0.5B / 1B：快速消融和多 seed
+1.5B / 3B：主要泛化实验
+7B：只作为有限核心组验证，除非资源非常充足
+```
+
+不要一开始就追求所有模型完整 9 组。更合理的是：
+
+```text
+一个主模型完整消融；
+两个到三个模型家族跑核心配置；
+一个较大模型跑核心 3 组展示可扩展性。
+```
+
+六、更强 privacy attack 和安全评估
+
+当前工作主要用 forget-client loss / global loss 评估 unlearning。未来期刊版本需要加入更直接的隐私风险评估。
+
+建议评估：
+
+```text
+Membership inference attack
+Data extraction / prompt leakage attack
+Canary insertion and extraction
+Forget subset perplexity
+Retained subset perplexity
+Generation quality on retained prompts
+Sensitive client reconstruction risk
+```
+
+具体设计：
+
+1. 在 forget client 中插入 canary 或敏感样本。
+2. fine-tuning 后测试模型是否能复现这些 canary。
+3. unlearning 后再次测试 canary exposure 是否下降。
+4. 同时检查 retained/global utility 是否维持。
+5. 对比 FL、FedHDS、forget-batch Hessian、retained-set guarded Hessian。
+
+更强的评价指标：
+
+```text
+Attack success rate
+Canary exposure score
+Membership inference AUC
+Forget-set perplexity increase
+Retained-set perplexity degradation
+Global benchmark score change
+```
+
+这样论文可以从“loss-based unlearning”升级为“privacy-aware federated LLM unlearning”。
+
+七、更真实的联邦设置
+
+当前设置固定 forget client 0，并使用有限 non-IID 设置。未来应扩展到更多真实联邦场景。
+
+建议补充：
+
+```text
+different forget clients
+multiple forget clients
+varying non-IID degrees
+different number of clients
+different client sampling fractions
+different local steps
+sensitive-domain clients
+imbalanced client data size
+```
+
+优先级：
+
+1. 多 forget client：证明结果不是 client 0 特例。
+2. 多 forget clients 同时遗忘：更接近真实删除请求。
+3. 不同 non-IID 程度：联邦场景关键变量。
+4. 不同 client fraction：检查联邦采样带来的稳定性变化。
+
+八、未来实验矩阵建议
+
+不要把所有组合全部跑满。未来期刊应采用分层实验矩阵。
+
+主实验：
+
+```text
+一个主数据集 + 一个主模型：
+完整 9 组消融
+多 seed
+多 forget client
+privacy attack
+```
+
+泛化实验：
+
+```text
+多个数据集：
+核心 5 组
+
+多个模型家族：
+核心 3 到 5 组
+
+更大模型：
+核心 3 组
+```
+
+核心 3 组：
+
+```text
+FedHDS
+forget_batch_hessian
+retained_negative_norm010_guard10
+```
+
+核心 5 组：
+
+```text
+FL
+FedHDS
+forget_batch_hessian
+retained_auto_forget_guard_tol0_guard10
+retained_negative_norm010_guard10
+```
+
+完整 9 组：
+
+```text
+FL
+FedHDS
+forget_batch_hessian
+retained_auto_direction_guard05
+retained_auto_forget_guard_tol0_guard05/guard10
+retained_auto_forget_guard_tol005_guard10
+retained_negative_norm005_guard05
+retained_negative_norm010_guard10
+retained_negative_norm015_guard10
+```
+
+九、未来论文可能的贡献点
+
+未来期刊版本可以组织成以下贡献：
+
+1. 提出一个 constrained Hessian-based federated LLM unlearning framework，把 forgetting strength、retained utility 和 privacy risk 放在统一优化视角下。
+2. 系统比较 forget-batch Hessian 和 retained-set Hessian，揭示 Hessian reference set 对 unlearning direction 和 utility preservation 的影响。
+3. 提出 guarded retained-set Hessian update，包括 direction probing、forget-loss guard、global-loss guard 和 update norm trust region。
+4. 给出局部二阶近似或 trust-region 理论分析，解释该方法为什么能控制 utility degradation。
+5. 在多数据集、多模型家族、多 forget client 和 privacy attack 下验证方法。
+
+十、未来论文标题候选
+
+英文标题候选：
+
+```text
+Guarded Retained-Set Hessian Unlearning for Federated Large Language Model Fine-Tuning
+Utility-Preserving Hessian-Based Unlearning in Federated Instruction-Tuned Language Models
+Constrained Second-Order Unlearning for Federated Large Language Models
+Privacy-Aware Guarded Hessian Unlearning for Federated LLMs
+```
+
+中文标题候选：
+
+```text
+面向联邦大语言模型微调的受约束 Hessian 遗忘方法研究
+面向效用保持的联邦大模型 Hessian 机器遗忘方法
+联邦指令微调场景下的 Guarded Retained-Set Hessian 遗忘机制
+```
+
+十一、未来推进路线
+
+第一阶段：当前小论文收口
+
+```text
+完成阶段四和 seed robustness。
+完成论文正文、图表和局限性。
+不再加入新实验方向。
+```
+
+第二阶段：理论和复现增强
+
+```text
+补多 seed。
+补多 forget client。
+整理理论框架。
+把当前代码整理为可复现实验管线。
+```
+
+第三阶段：隐私攻击评估
+
+```text
+加入 membership inference attack。
+加入 canary extraction。
+加入 retained/forget perplexity。
+加入 generation quality check。
+```
+
+第四阶段：外部泛化
+
+```text
+加入 Alpaca/OASST 等数据集。
+加入 Llama/OPT/Pythia/Phi 等模型家族。
+采用核心 3 组或 5 组，不必所有组合完整 9 组。
+```
+
+第五阶段：中高水平期刊版本
+
+```text
+整合理论、隐私攻击、多数据集、多模型家族和真实联邦设置。
+强调方法的原则性和边界，而不是仅仅展示更多实验。
+```
+
+十二、关键提醒
+
+未来扩展时要避免以下问题：
+
+```text
+不要把论文写成实验堆叠。
+不要无原则增加模型和数据集。
+不要只报告有利结果。
+不要夸大为所有场景普适。
+不要忽视 privacy attack 和真实遗忘风险。
+```
+
+未来高水平论文的关键不是“实验更多”，而是：
+
+```text
+问题定义清楚；
+方法有原则性；
+理论解释和实验现象一致；
+隐私评估覆盖真实风险；
+实验矩阵有层次；
+局限性诚实；
+结论边界明确。
+```
+
+最终方向：
+
+```text
+当前小论文先收口。
+未来以当前 retained-set guarded Hessian unlearning 为核心机制，向理论化、隐私化、多场景泛化方向继续深入。
+```

@@ -1,0 +1,34 @@
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local caches and temporary folders
+.claude/
+_tmp_read_paper_submission_v2/
+
+# Experiment outputs and local runs
+exp/
+exp_lrdecay/
+formal_cloud_results/
+formal_cloud_results_autodl_20260503/
+formal_cloud_results_formal_minimal_20260503_combined/
+formal_cloud_results_smoke/
+formal_local_compare_20260429/
+stage3_results_flat_20260504_short/
+
+# Archives and packaged artifacts
+*.tar.gz
+*.zip
+
+# Generated logs/results
+final_results.json
+summary.csv
+nohup.out
+*.log
+
+# Word/backup artifacts that should not be versioned
+*.bak.docx
+*.before_*.docx
+
