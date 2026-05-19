@@ -79,7 +79,7 @@ plot_seed() {
 
 run_mia_seed() {
   local seed="$1"
-  "${PYTHON_BIN}" scripts/mia_loss_based.py "${ROOT}/seed${seed}" --checkpoint-label auto --sample-limit "${MIA_SAMPLE_LIMIT}"
+  "${PYTHON_BIN}" scripts/mia_loss_based.py "${ROOT}/seed${seed}" --checkpoint-label auto --sample-limit "${MIA_SAMPLE_LIMIT}" --forget-client-idx "${FORGET_CLIENT_IDX}"
 }
 
 read_guard() {

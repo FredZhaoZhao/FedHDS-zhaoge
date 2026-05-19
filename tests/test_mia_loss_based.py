@@ -1,6 +1,7 @@
 import random
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -90,6 +91,44 @@ class MiaLossBasedHelpersTests(unittest.TestCase):
         )
 
         self.assertEqual(idx, 3)
+
+    def test_resolve_forget_client_idx_falls_back_to_sibling_seed_results(self):
+        parser = build_arg_parser()
+        args = parse_saved_config(
+            {
+                "forget_client_idx": "-1",
+                "retrain_exclude_client": "-1",
+            },
+            parser,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seed_root = Path(tmpdir) / "seed42"
+            fl_dir = seed_root / "fl"
+            oracle_dir = seed_root / "retrain_oracle"
+            fl_dir.mkdir(parents=True)
+            oracle_dir.mkdir(parents=True)
+
+            fl_result = fl_dir / "final_results.json"
+            fl_result.write_text(
+                '{"config": {}, "experiment_metrics": {}}',
+                encoding="utf-8",
+            )
+            (oracle_dir / "final_results.json").write_text(
+                (
+                    '{"config": {"retrain_exclude_client": "-1"}, '
+                    '"experiment_metrics": {"forget_client_idx": 0}}'
+                ),
+                encoding="utf-8",
+            )
+
+            idx = resolve_forget_client_idx(
+                args,
+                {"experiment_metrics": {}},
+                result_path=fl_result,
+            )
+
+        self.assertEqual(idx, 0)
 
 
 if __name__ == "__main__":

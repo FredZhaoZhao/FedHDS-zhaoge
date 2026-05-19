@@ -260,25 +260,74 @@ def _compute_per_example_losses(server, data_loader):
     return losses
 
 
-def resolve_forget_client_idx(args, result):
+def _coerce_nonnegative_int(candidate):
+    try:
+        idx = int(candidate)
+    except (TypeError, ValueError):
+        return None
+    return idx if idx >= 0 else None
+
+
+def _infer_forget_client_idx_from_sibling_runs(result_path):
+    if result_path is None:
+        return None
+
+    seed_root = Path(result_path).resolve().parent.parent
+    if not seed_root.exists():
+        return None
+
+    inferred = set()
+    for sibling_path in sorted(seed_root.rglob("final_results.json")):
+        if sibling_path.resolve() == Path(result_path).resolve():
+            continue
+
+        sibling_result = _load_result_json(sibling_path)
+        sibling_metrics = sibling_result.get("experiment_metrics") or {}
+        sibling_candidates = [
+            sibling_metrics.get("forget_client_idx"),
+            sibling_metrics.get("retrain_exclude_client_idx"),
+            sibling_metrics.get("retrain_exclude_client"),
+        ]
+        sibling_args = parse_saved_config(sibling_result.get("config", {}), build_arg_parser())
+        sibling_candidates.extend(
+            [
+                getattr(sibling_args, "forget_client_idx", None),
+                getattr(sibling_args, "retrain_exclude_client", None),
+            ]
+        )
+
+        for candidate in sibling_candidates:
+            idx = _coerce_nonnegative_int(candidate)
+            if idx is not None:
+                inferred.add(idx)
+
+    if len(inferred) == 1:
+        return inferred.pop()
+    return None
+
+
+def resolve_forget_client_idx(args, result, result_path=None, fallback_forget_client_idx=None):
     metrics = result.get("experiment_metrics") or {}
     candidates = [
         metrics.get("forget_client_idx"),
         metrics.get("retrain_exclude_client_idx"),
+        fallback_forget_client_idx,
         getattr(args, "forget_client_idx", None),
         getattr(args, "retrain_exclude_client", None),
     ]
     for candidate in candidates:
-        try:
-            idx = int(candidate)
-        except (TypeError, ValueError):
-            continue
-        if idx >= 0:
+        idx = _coerce_nonnegative_int(candidate)
+        if idx is not None:
             return idx
+
+    sibling_idx = _infer_forget_client_idx_from_sibling_runs(result_path)
+    if sibling_idx is not None:
+        return sibling_idx
+
     raise ValueError("Could not resolve a valid forget client index for MIA evaluation.")
 
 
-def evaluate_run(result_path, checkpoint_label="auto", sample_limit=0):
+def evaluate_run(result_path, checkpoint_label="auto", sample_limit=0, fallback_forget_client_idx=None):
     import torch
     from server import Server
 
@@ -294,7 +343,12 @@ def evaluate_run(result_path, checkpoint_label="auto", sample_limit=0):
             f"for checkpoint_label={checkpoint_label!r}."
         )
 
-    forget_client_idx = resolve_forget_client_idx(args, result)
+    forget_client_idx = resolve_forget_client_idx(
+        args,
+        result,
+        result_path=result_path,
+        fallback_forget_client_idx=fallback_forget_client_idx,
+    )
     target_client = client_list[forget_client_idx]
     member_examples, nonmember_examples = _build_member_nonmember_examples(
         client_list=client_list,
@@ -352,6 +406,12 @@ def main():
         default=0,
         help="Optional cap for member/non-member set size. 0 means full forget-client size.",
     )
+    parser.add_argument(
+        "--forget-client-idx",
+        type=int,
+        default=-1,
+        help="Optional fallback forget-client index for runs that do not record it explicitly.",
+    )
     args = parser.parse_args()
 
     result_paths = _iter_result_paths(args.target)
@@ -363,6 +423,7 @@ def main():
             result_path=result_path,
             checkpoint_label=args.checkpoint_label,
             sample_limit=args.sample_limit,
+            fallback_forget_client_idx=args.forget_client_idx,
         )
         print(
             f"[MIA] {result_path}: "
