@@ -8,6 +8,7 @@ export HF_HOME="${HF_HOME:-${PROJECT_ROOT}/.hf_cache}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
 export HF_HUB_DISABLE_TELEMETRY=1
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 ROOT="${ROOT:-formal_cloud_results/v3_core_$(date +%Y%m%d)}"

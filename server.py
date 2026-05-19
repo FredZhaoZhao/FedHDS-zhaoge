@@ -313,6 +313,31 @@ class Server(object):
 
         return loss_sum / total_samples
 
+    def _compute_average_hvp_on_loader(self, data_loader, params, vec):
+        hvp_sums = [torch.zeros_like(param, dtype=torch.float32, device=param.device) for param in params]
+        total_samples = 0
+
+        for batch in data_loader:
+            batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            with self._second_order_attention_context(), self._autocast_context():
+                outputs = self.model(**batch)
+                loss = outputs.loss
+
+            if not torch.isfinite(loss):
+                continue
+
+            batch_size = batch['input_ids'].size(0)
+            hvp_batch = self.compute_hvp(loss, params, vec)
+            for idx, hvp_item in enumerate(hvp_batch):
+                hvp_sums[idx].add_(hvp_item.detach().to(torch.float32), alpha=batch_size)
+
+            total_samples += batch_size
+
+        if total_samples == 0:
+            return None
+
+        return [hvp_sum / total_samples for hvp_sum in hvp_sums]
+
     def _compute_batch_loss_value(self, batch):
         batch = {k: v.to(self.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         if not batch:
@@ -830,20 +855,19 @@ class Server(object):
         print("[FedHDS] Estimating Inverse Hessian Vector Product...")
         reference_loss = None
         ref_loader = None
+        use_retained_reference_hvp = False
 
         if use_retained_hessian:
             ref_loader, ref_size = self.build_retained_reference_loader(forget_client_idx, client_list)
             print(f"[FedHDS] Retained reference set size: {ref_size}")
             self.experiment_metrics['retained_reference_set_size'] = ref_size
-            if ref_loader is not None:
-                reference_loss = self._compute_average_loss(ref_loader)
-
-            if reference_loss is None:
+            use_retained_reference_hvp = ref_loader is not None and ref_size > 0
+            if not use_retained_reference_hvp:
                 print("[FedHDS] Retained reference set unavailable. Falling back to forget-batch Hessian.")
         else:
             self.experiment_metrics['retained_reference_set_size'] = 0
 
-        if reference_loss is None:
+        if not use_retained_reference_hvp:
             print("[FedHDS] Using forget client batch as Hessian reference.")
             self.experiment_metrics['effective_hessian_reference_mode'] = 'forget-batch'
             with self._second_order_attention_context(), self._autocast_context():
@@ -859,7 +883,18 @@ class Server(object):
         self.experiment_metrics['lissa_damping'] = damping
 
         for _ in range(recursion_depth):
-            hvp = self.compute_hvp(reference_loss, params, inverse_hvp)
+            if use_retained_reference_hvp:
+                hvp = self._compute_average_hvp_on_loader(ref_loader, params, inverse_hvp)
+                if hvp is None:
+                    print("[FedHDS] Retained HVP loader produced no valid batches. Falling back to forget-batch Hessian.")
+                    self.experiment_metrics['effective_hessian_reference_mode'] = 'forget-batch'
+                    use_retained_reference_hvp = False
+                    with self._second_order_attention_context(), self._autocast_context():
+                        reference_outputs = self.model(**reference_batch)
+                        reference_loss = reference_outputs.loss
+                    hvp = self.compute_hvp(reference_loss, params, inverse_hvp)
+            else:
+                hvp = self.compute_hvp(reference_loss, params, inverse_hvp)
             hvp_stats = self._tensor_list_stats(hvp)
             self.experiment_metrics['last_hvp_l2_norm'] = hvp_stats['l2_norm']
             self.experiment_metrics['last_hvp_max_abs'] = hvp_stats['max_abs']
