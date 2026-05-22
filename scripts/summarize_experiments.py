@@ -1,12 +1,16 @@
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 
 
 FIELDNAMES = [
     'group',
     'path',
+    'seed_id',
+    'is_anomalous',
+    'anomaly_reason',
     'unlearning_method',
     'round2_global_loss',
     'final_global_loss',
@@ -63,6 +67,35 @@ def _get(mapping, *keys, default=''):
     return default
 
 
+def _seed_id_from_group(group):
+    if not group:
+        return ''
+    first_part = str(group).split('/', 1)[0]
+    return first_part if re.fullmatch(r'seed\d+', first_part) else ''
+
+
+def _group_name(group):
+    return str(group).rsplit('/', 1)[-1]
+
+
+def _to_float(value):
+    try:
+        if value in ('', None):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value):
+    try:
+        if value in ('', None):
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _infer_group(root, result_path):
     rel_parts = result_path.relative_to(root).parts
     if 'exp' in rel_parts:
@@ -72,6 +105,11 @@ def _infer_group(root, result_path):
     if len(rel_parts) > 1:
         return rel_parts[0]
     return result_path.parent.name
+
+
+def _should_skip_result_path(root, result_path):
+    rel_parts = result_path.relative_to(root).parts
+    return any(part.startswith('appendix_') for part in rel_parts)
 
 
 def _summarize_result(root, result_path):
@@ -85,6 +123,9 @@ def _summarize_result(root, result_path):
     return {
         'group': _infer_group(root, result_path),
         'path': str(result_path.relative_to(root)),
+        'seed_id': '',
+        'is_anomalous': False,
+        'anomaly_reason': '',
         'unlearning_method': _get(metrics, 'unlearning_method', default=config.get('unlearn_method', '')),
         'round2_global_loss': eval_history[1] if len(eval_history) > 1 else '',
         'final_global_loss': eval_history[-1] if eval_history else '',
@@ -177,10 +218,56 @@ def _summarize_result(root, result_path):
     }
 
 
+def _annotate_anomalous_rows(rows):
+    annotated_rows = [dict(row) for row in rows]
+    grouped = {}
+    for row in annotated_rows:
+        seed_id = _seed_id_from_group(row.get('group', ''))
+        row['seed_id'] = seed_id
+        grouped.setdefault(seed_id, []).append(row)
+
+    baseline_groups = {'fl', 'fedhds', 'retrain_oracle'}
+    for seed_id, seed_rows in grouped.items():
+        if not seed_id:
+            for row in seed_rows:
+                row['is_anomalous'] = False
+                row['anomaly_reason'] = ''
+            continue
+
+        reasons = []
+        baseline_rows = [row for row in seed_rows if _group_name(row.get('group', '')) in baseline_groups]
+        if baseline_rows:
+            baseline_losses = []
+            for row in baseline_rows:
+                for key in ('round2_global_loss', 'final_global_loss'):
+                    value = _to_float(row.get(key))
+                    if value is not None:
+                        baseline_losses.append(value)
+            if any(loss >= 5.0 for loss in baseline_losses):
+                reasons.append('baseline_diverged')
+
+            member_counts = [_to_int(row.get('mia_member_count')) for row in baseline_rows]
+            member_counts = [count for count in member_counts if count is not None]
+            if member_counts and min(member_counts) < 150:
+                reasons.append('forget_client_too_small')
+
+        reason_text = ','.join(reasons)
+        for row in seed_rows:
+            row['is_anomalous'] = bool(reasons)
+            row['anomaly_reason'] = reason_text
+
+    return annotated_rows
+
+
 def main():
     parser = argparse.ArgumentParser(description='Summarize final_results.json files into one CSV.')
     parser.add_argument('root', help='Experiment root directory to scan recursively.')
     parser.add_argument('--output', default='', help='CSV path. Defaults to <root>/summary.csv.')
+    parser.add_argument(
+        '--exclude-anomalous-seeds',
+        action='store_true',
+        help='Omit rows whose seed is flagged as anomalous by the baseline-health heuristic.',
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -188,9 +275,14 @@ def main():
         raise FileNotFoundError(f'Experiment root does not exist: {root}')
 
     output_path = Path(args.output).resolve() if args.output else root / 'summary.csv'
-    result_paths = sorted(root.rglob('final_results.json'))
+    result_paths = sorted(
+        path for path in root.rglob('final_results.json') if not _should_skip_result_path(root, path)
+    )
 
     rows = [_summarize_result(root, result_path) for result_path in result_paths]
+    rows = _annotate_anomalous_rows(rows)
+    if args.exclude_anomalous_seeds:
+        rows = [row for row in rows if not row.get('is_anomalous')]
     with output_path.open('w', encoding='utf-8', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         writer.writeheader()

@@ -162,24 +162,36 @@ def _note(row):
     forget_before = row.get('forget_client_loss_before_unlearning')
     forget_after = row.get('forget_client_loss_after_unlearning')
     guard_reason = str(_get(row, 'unlearn_guard_stop_reason', '')).strip()
+    anomaly_flag = str(_get(row, 'is_anomalous', '')).strip().lower() == 'true'
+    anomaly_reason = str(_get(row, 'anomaly_reason', '')).strip()
+    anomaly_note = ''
+    if anomaly_flag:
+        anomaly_note = 'anomalous seed'
+        if anomaly_reason and anomaly_reason != 'nan':
+            anomaly_note = f'{anomaly_note} ({anomaly_reason})'
 
     if mode in ('', 'nan'):
-        return 'utility baseline'
+        return f'{anomaly_note}; utility baseline'.strip('; ') if anomaly_note else 'utility baseline'
     if guard_reason and guard_reason not in ('completed', 'nan'):
-        return f'guard stopped by {guard_reason}'
+        tail = f'guard stopped by {guard_reason}'
+        return f'{anomaly_note}; {tail}'.strip('; ') if anomaly_note else tail
     best_probe_delta = row.get('unlearn_best_probe_direction_forget_delta')
     best_probe_sign = str(_get(row, 'unlearn_best_probe_update_sign', '')).strip()
     if pd.notna(best_probe_delta) and best_probe_sign and best_probe_sign != 'nan':
         if best_probe_sign == 'negative':
-            return f'best probe sign negative, forget delta {_fmt(best_probe_delta)}'
-        return f'best probe forget delta {_fmt(best_probe_delta)}'
+            tail = f'best probe sign negative, forget delta {_fmt(best_probe_delta)}'
+            return f'{anomaly_note}; {tail}'.strip('; ') if anomaly_note else tail
+        tail = f'best probe forget delta {_fmt(best_probe_delta)}'
+        return f'{anomaly_note}; {tail}'.strip('; ') if anomaly_note else tail
     if pd.notna(final_loss) and float(final_loss) >= 5:
-        return 'unstable in this setting'
+        tail = 'unstable in this setting'
+        return f'{anomaly_note}; {tail}'.strip('; ') if anomaly_note else tail
     if pd.notna(forget_before) and pd.notna(forget_after):
         gain = float(forget_after) - float(forget_before)
         if gain > 0:
-            return 'forget loss increased'
-    return ''
+            tail = 'forget loss increased'
+            return f'{anomaly_note}; {tail}'.strip('; ') if anomaly_note else tail
+    return anomaly_note
 
 
 def build_table(summary_csv):

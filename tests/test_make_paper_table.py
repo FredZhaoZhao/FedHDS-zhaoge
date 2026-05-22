@@ -27,6 +27,8 @@ class BuildPaperTableTests(unittest.TestCase):
                         "mia_loss_tpr_at_fpr001",
                         "unlearn_guard_stop_reason",
                         "unlearning_method",
+                        "is_anomalous",
+                        "anomaly_reason",
                     ],
                 )
                 writer.writeheader()
@@ -45,6 +47,8 @@ class BuildPaperTableTests(unittest.TestCase):
                         "mia_loss_tpr_at_fpr001": "0.22",
                         "unlearn_guard_stop_reason": "completed",
                         "unlearning_method": "ga_guarded",
+                        "is_anomalous": "True",
+                        "anomaly_reason": "baseline_diverged,forget_client_too_small",
                     }
                 )
 
@@ -55,6 +59,7 @@ class BuildPaperTableTests(unittest.TestCase):
         self.assertEqual(rows[0]["mia_auc"], "0.6100")
         self.assertEqual(rows[0]["mia_tpr_at_fpr001"], "0.2200")
         self.assertEqual(rows[0]["method"], "ga_guarded")
+        self.assertIn("anomalous seed", rows[0]["note"])
 
 
 if __name__ == "__main__":

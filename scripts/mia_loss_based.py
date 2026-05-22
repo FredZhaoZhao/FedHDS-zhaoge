@@ -142,6 +142,27 @@ def sample_category_matched_nonmembers(member_categories, candidate_categories, 
     return selected[:sample_size]
 
 
+def build_holdout_nonmembers_from_examples(member_examples, full_examples, sampled_indices, sample_size=None, rng=None):
+    rng = rng or random.Random(0)
+    sampled_index_set = set(sampled_indices)
+    holdout_examples = [
+        example
+        for idx, example in enumerate(full_examples)
+        if idx not in sampled_index_set
+    ]
+    member_categories = [example["categories"] for example in member_examples]
+    holdout_categories = [example["categories"] for example in holdout_examples]
+    target_size = len(member_examples) if sample_size is None else min(sample_size, len(member_examples))
+    target_size = min(target_size, len(holdout_examples))
+    selected_indices = sample_category_matched_nonmembers(
+        member_categories=member_categories,
+        candidate_categories=holdout_categories,
+        sample_size=target_size,
+        rng=rng,
+    )
+    return [holdout_examples[idx] for idx in selected_indices]
+
+
 def _load_result_json(result_path):
     with open(result_path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -174,6 +195,61 @@ def _setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def _resolve_dolly_path(args):
+    candidate_paths = []
+    if getattr(args, "data_path", ""):
+        candidate_paths.append(Path(args.data_path).expanduser())
+    candidate_paths.append(PROJECT_ROOT / "data" / "databricks-dolly-15k.jsonl")
+    candidate_paths.append(Path("data") / "databricks-dolly-15k.jsonl")
+
+    for candidate in candidate_paths:
+        candidate = candidate.resolve() if candidate.is_absolute() else (PROJECT_ROOT / candidate).resolve()
+        if candidate.exists():
+            return candidate
+    searched = "\n".join(str(path) for path in candidate_paths)
+    raise FileNotFoundError(f"Cannot resolve Dolly dataset file for MIA. Searched:\n{searched}")
+
+
+def _build_tokenizer(args):
+    from transformers import AutoTokenizer
+    from utils_data.default_tokens import DefaultToken
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer.model_max_length = args.max_length
+    special_tokens = {}
+    if tokenizer.pad_token is None:
+        special_tokens["pad_token"] = DefaultToken.PAD_TOKEN.value
+    if tokenizer.eos_token is None:
+        special_tokens["eos_token"] = DefaultToken.EOS_TOKEN.value
+    if tokenizer.bos_token is None:
+        special_tokens["bos_token"] = DefaultToken.BOS_TOKEN.value
+    if tokenizer.unk_token is None:
+        special_tokens["unk_token"] = DefaultToken.UNK_TOKEN.value
+    tokenizer.add_special_tokens(special_tokens)
+    return tokenizer
+
+
+def _sampled_dataset_indices(dataset_size, data_sample, seed):
+    import torch
+
+    sample_size = int(dataset_size * float(data_sample))
+    sample_size = max(0, min(sample_size, dataset_size))
+    generator = torch.Generator().manual_seed(int(seed))
+    permutation = torch.randperm(dataset_size, generator=generator).tolist()
+    sampled = permutation[:sample_size]
+    holdout = permutation[sample_size:]
+    return sampled, holdout
+
+
+def _load_full_dolly_examples(args):
+    from utils_data.llm_dataset import LLMDataset
+
+    tokenizer = _build_tokenizer(args)
+    dolly_path = _resolve_dolly_path(args)
+    dataset = LLMDataset(str(dolly_path), tokenizer=tokenizer, generation=False)
+    return [dataset[idx] for idx in range(len(dataset))]
 
 
 def _rebuild_clients(args):
@@ -210,6 +286,24 @@ def _build_member_nonmember_examples(client_list, forget_client_idx, sample_size
     )
     nonmember_examples = [candidate_examples[idx] for idx in selected_indices]
     return member_examples[:target_size], nonmember_examples
+
+
+def _build_independent_member_nonmember_examples(args, client_list, forget_client_idx, sample_size=None, rng=None):
+    rng = rng or random.Random(0)
+    target_client = client_list[forget_client_idx]
+    member_examples = list(target_client.full_train_dataset)
+    full_examples = _load_full_dolly_examples(args)
+    sampled_indices, _ = _sampled_dataset_indices(len(full_examples), args.data_sample, args.seed)
+    target_size = len(member_examples) if sample_size is None else min(sample_size, len(member_examples))
+    member_examples = member_examples[:target_size]
+    nonmember_examples = build_holdout_nonmembers_from_examples(
+        member_examples=member_examples,
+        full_examples=full_examples,
+        sampled_indices=sampled_indices,
+        sample_size=target_size,
+        rng=rng,
+    )
+    return member_examples, nonmember_examples, len(full_examples) - len(sampled_indices)
 
 
 def _build_loader_from_examples(target_client, examples):
@@ -350,12 +444,27 @@ def evaluate_run(result_path, checkpoint_label="auto", sample_limit=0, fallback_
         fallback_forget_client_idx=fallback_forget_client_idx,
     )
     target_client = client_list[forget_client_idx]
-    member_examples, nonmember_examples = _build_member_nonmember_examples(
-        client_list=client_list,
-        forget_client_idx=forget_client_idx,
-        sample_size=sample_limit if sample_limit > 0 else None,
-        rng=random.Random(args.seed),
-    )
+    nonmember_source = "other_clients_train_pool"
+    nonmember_pool_count = 0
+    if str(getattr(args, "dataset", "")).lower() == "dolly":
+        member_examples, nonmember_examples, nonmember_pool_count = _build_independent_member_nonmember_examples(
+            args=args,
+            client_list=client_list,
+            forget_client_idx=forget_client_idx,
+            sample_size=sample_limit if sample_limit > 0 else None,
+            rng=random.Random(args.seed),
+        )
+        nonmember_source = "dolly_holdout"
+    else:
+        member_examples, nonmember_examples = _build_member_nonmember_examples(
+            client_list=client_list,
+            forget_client_idx=forget_client_idx,
+            sample_size=sample_limit if sample_limit > 0 else None,
+            rng=random.Random(args.seed),
+        )
+        nonmember_pool_count = sum(
+            len(client.full_train_dataset) for client in client_list if client.idx != forget_client_idx
+        )
 
     member_loader = _build_loader_from_examples(target_client, member_examples)
     nonmember_loader = _build_loader_from_examples(target_client, nonmember_examples)
@@ -374,6 +483,8 @@ def evaluate_run(result_path, checkpoint_label="auto", sample_limit=0, fallback_
         "mia_member_count": len(member_losses),
         "mia_nonmember_count": len(nonmember_losses),
         "mia_score_type": "negative_loss",
+        "mia_nonmember_source": nonmember_source,
+        "mia_nonmember_pool_count": int(nonmember_pool_count),
         "mia_loss_auc": roc_auc_from_scores(labels, membership_scores),
         "mia_loss_tpr_at_fpr001": tpr_at_fpr(labels, membership_scores, 0.01),
         "mia_member_mean_loss": float(np.mean(member_losses)) if member_losses else float("nan"),

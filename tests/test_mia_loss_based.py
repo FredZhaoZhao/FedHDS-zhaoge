@@ -7,6 +7,7 @@ from pathlib import Path
 
 from cli_config import build_arg_parser
 from scripts.mia_loss_based import (
+    build_holdout_nonmembers_from_examples,
     parse_saved_config,
     roc_auc_from_scores,
     resolve_forget_client_idx,
@@ -50,6 +51,32 @@ class MiaLossBasedHelpersTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         selected_categories = [candidate_categories[idx] for idx in selected]
         self.assertCountEqual(selected_categories, [0, 0, 1])
+
+    def test_holdout_nonmembers_are_drawn_from_unsampled_pool(self):
+        full_examples = [
+            {"example_id": "train-a", "categories": 0},
+            {"example_id": "train-b", "categories": 1},
+            {"example_id": "train-c", "categories": 0},
+            {"example_id": "holdout-a", "categories": 0},
+            {"example_id": "holdout-b", "categories": 1},
+            {"example_id": "holdout-c", "categories": 2},
+        ]
+        sampled_indices = [0, 1, 2]
+        member_examples = [full_examples[0], full_examples[1]]
+
+        nonmembers = build_holdout_nonmembers_from_examples(
+            member_examples=member_examples,
+            full_examples=full_examples,
+            sampled_indices=sampled_indices,
+            sample_size=2,
+            rng=random.Random(0),
+        )
+
+        self.assertEqual(len(nonmembers), 2)
+        self.assertEqual(
+            sorted(example["example_id"] for example in nonmembers),
+            ["holdout-a", "holdout-b"],
+        )
 
     def test_saved_config_parser_restores_typed_values(self):
         parser = build_arg_parser()
